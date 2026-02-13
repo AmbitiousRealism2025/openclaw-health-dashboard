@@ -12,14 +12,17 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DASHBOARD_PATH="${SCRIPT_DIR}/agent-health.md"
+INCIDENT_LOG_PATH="${SCRIPT_DIR}/agent-health-incidents.md"
 LOCK_DIR="/tmp/agent-health-dashboard.lock"
 LOCK_TIMEOUT=10
 ALERT_FILE="/tmp/agent-health-last-alert"
 DEBOUNCE_SECONDS=1800  # 30 minutes
+STATE_DIR="/tmp/agent-health-state"
 
 # Temp files for agent data (avoids associative arrays for bash 3 compatibility)
 TEMP_DIR="/tmp/agent-health-data"
 mkdir -p "$TEMP_DIR"
+mkdir -p "$STATE_DIR"
 
 # Dry run mode (don't send alerts)
 DRY_RUN=0
@@ -56,6 +59,76 @@ format_staleness() {
     else
         echo "${minutes}m"
     fi
+}
+
+# Function to get previous state for an agent
+get_previous_state() {
+    local agent="$1"
+    local state_file="${STATE_DIR}/${agent}.state"
+    if [ -f "$state_file" ]; then
+        cat "$state_file"
+    else
+        echo "unknown"
+    fi
+}
+
+# Function to save current state for an agent
+save_state() {
+    local agent="$1"
+    local state="$2"
+    echo "$state" > "${STATE_DIR}/${agent}.state"
+}
+
+# Function to log incident to agent-health-incidents.md
+log_incident() {
+    local agent="$1"
+    local incident_type="$2"  # warning, critical, or recovered
+    local stale_time="$3"
+    local model="$4"
+    local channel="$5"
+
+    local timestamp
+    timestamp=$(date '+%Y-%m-%dT%H:%M:%S %Z')
+
+    # Determine emoji based on type
+    local emoji
+    case "$incident_type" in
+        warning)  emoji="🟡" ;;
+        critical) emoji="🔴" ;;
+        recovered) emoji="🟢" ;;
+        *)        emoji="⚪" ;;
+    esac
+
+    # Append to incident log
+    {
+        echo ""
+        echo "## ${timestamp}"
+        if [ "$incident_type" = "recovered" ]; then
+            echo "- ${emoji} ${agent}: Recovered"
+        else
+            local stale_human
+            stale_human=$(format_staleness "$stale_time")
+            # Capitalize first letter for display (bash 3 compatible)
+            local type_display
+            case "$incident_type" in
+                warning)  type_display="Warning" ;;
+                critical) type_display="Critical" ;;
+                *)        type_display="$incident_type" ;;
+            esac
+            echo "- ${emoji} ${agent}: ${type_display} (${stale_human} stale)"
+            echo "- Model: ${model}"
+            echo "- Channel: ${channel}"
+        fi
+    } >> "$INCIDENT_LOG_PATH"
+
+    echo "Logged incident: ${emoji} ${agent} ${incident_type}"
+}
+
+# Function to extract agent metadata from dashboard section
+extract_agent_metadata() {
+    local section="$1"
+    local field="$2"
+    echo "$section" | grep "\*\*${field}:\*\*" | sed "s/.*\*\*${field}:\*\* //" | xargs
 }
 
 # Function to acquire lock (mkdir is atomic on all Unix systems)
@@ -172,8 +245,17 @@ for AGENT in $KNOWN_AGENTS; do
     STALE_MINUTES=$((STALE_SECONDS / 60))
     echo "$STALE_MINUTES" > "${TEMP_DIR}/${AGENT}-stale"
 
+    # Determine current status and get previous state for incident logging
+    PREV_STATE=$(get_previous_state "$AGENT")
+    CURRENT_STATE="healthy"
+
+    # Extract metadata for incident logging
+    AGENT_MODEL=$(extract_agent_metadata "$AGENT_SECTION" "Model")
+    AGENT_CHANNEL=$(extract_agent_metadata "$AGENT_SECTION" "Channel")
+
     # Determine status
     if [ "$STALE_MINUTES" -gt 60 ]; then
+        CURRENT_STATE="critical"
         STALENESS_HUMAN=$(format_staleness "$STALE_MINUTES")
         if [ -n "$ALERT_MESSAGES" ]; then
             ALERT_MESSAGES="${ALERT_MESSAGES}
@@ -182,12 +264,36 @@ for AGENT in $KNOWN_AGENTS; do
         ALERT_MESSAGES="${ALERT_MESSAGES}🔴 ${AGENT}: Critical (${STALENESS_HUMAN} since last ping)"
         CRITICAL_AGENTS="${CRITICAL_AGENTS} ${AGENT}"
     elif [ "$STALE_MINUTES" -gt 30 ]; then
+        CURRENT_STATE="warning"
         STALENESS_HUMAN=$(format_staleness "$STALE_MINUTES")
         if [ -n "$ALERT_MESSAGES" ]; then
             ALERT_MESSAGES="${ALERT_MESSAGES}
 "
         fi
         ALERT_MESSAGES="${ALERT_MESSAGES}🟡 ${AGENT}: Warning (${STALENESS_HUMAN} since last ping)"
+    fi
+
+    # Log incident if state changed (skip in dry-run mode)
+    if [ "$DRY_RUN" -ne 1 ]; then
+        if [ "$CURRENT_STATE" != "$PREV_STATE" ]; then
+            # State transition detected
+            case "$CURRENT_STATE" in
+                warning|critical)
+                    # Agent went into warning or critical state
+                    if [ "$PREV_STATE" = "healthy" ] || [ "$PREV_STATE" = "unknown" ]; then
+                        log_incident "$AGENT" "$CURRENT_STATE" "$STALE_MINUTES" "$AGENT_MODEL" "$AGENT_CHANNEL"
+                    fi
+                    ;;
+                healthy)
+                    # Agent recovered
+                    if [ "$PREV_STATE" = "warning" ] || [ "$PREV_STATE" = "critical" ]; then
+                        log_incident "$AGENT" "recovered" "0" "$AGENT_MODEL" "$AGENT_CHANNEL"
+                    fi
+                    ;;
+            esac
+        fi
+        # Save current state
+        save_state "$AGENT" "$CURRENT_STATE"
     fi
 done
 

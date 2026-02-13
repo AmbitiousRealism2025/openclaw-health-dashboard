@@ -7,6 +7,7 @@ A lightweight, dependency-free health monitoring system for tracking agent statu
 - **Dashboard**: Human-readable markdown file showing all agent statuses
 - **Update Script**: Called by each agent on heartbeat
 - **Monitoring Script**: Cron job that alerts when agents go stale
+- **Incident Log**: Append-only log of health state transitions
 
 ## Status Indicators
 
@@ -16,6 +17,39 @@ A lightweight, dependency-free health monitoring system for tracking agent statu
 | Warning | 🟡 | Last ping 30-60 min |
 | Critical | 🔴 | Last ping > 60 min |
 | Unknown | ⚪ | No data / parse error |
+
+## Incident Logging
+
+When the monitoring script detects a state transition (healthy → warning/critical, or warning/critical → healthy), it logs the incident to `agent-health-incidents.md`.
+
+### Incident Types
+
+| Type | Emoji | Description |
+|------|-------|-------------|
+| Warning | 🟡 | Agent hasn't pinged in 30-60 minutes |
+| Critical | 🔴 | Agent hasn't pinged in >60 minutes |
+| Recovered | 🟢 | Agent returned to healthy after being in warning/critical |
+
+### Example Log Entries
+
+```markdown
+## 2026-02-13T10:45:00 EST
+- 🟡 Leto: Warning (35m stale)
+- Model: minimax/minimax-m2.5
+- Channel: telegram
+
+## 2026-02-13T11:15:00 EST
+- 🟢 Leto: Recovered
+
+## 2026-02-13T14:30:00 EST
+- 🔴 Stilgar: Critical (1h 15m stale)
+- Model: anthropic/claude-opus-4-6
+- Channel: telegram
+```
+
+### State Tracking
+
+State is persisted in `/tmp/agent-health-state/` to detect transitions between runs.
 
 ## Quick Start
 
@@ -82,6 +116,7 @@ The update script uses these environment variables (optional):
 ```
 openclaw-health-dashboard/
 ├── agent-health.md              # Dashboard file
+├── agent-health-incidents.md    # Incident log (append-only)
 ├── update-health-dashboard.sh   # Agent heartbeat hook
 ├── check-agent-health.sh        # Monitoring cron script
 ├── README.md                    # This file
@@ -89,7 +124,8 @@ openclaw-health-dashboard/
 └── tests/                       # Validation tests
     ├── test-update.sh
     ├── test-monitor.sh
-    └── test-locking.sh
+    ├── test-locking.sh
+    └── test-incident-log.sh
 ```
 
 ## Configuration
